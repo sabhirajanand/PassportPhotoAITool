@@ -1,0 +1,45 @@
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist-eggs/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+*.spec.bak
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+
+# Project temp & outputs
+assets/temp/*
+!assets/temp/.gitkeep
+*.log
+
+# Optional: downloaded build artifacts (if you unzip here)
+PassportPhotoCreator-Windows.zip

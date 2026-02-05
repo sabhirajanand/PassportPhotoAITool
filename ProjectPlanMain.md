@@ -1,0 +1,7 @@
+1. Image Upload & Background RemovalYou can use the Gemini API to "reimagine" the background, but for a strict passport requirement, a clean removal is better.The "Hybrid" Approach: Use a library like rembg to remove the background locally.Gemini's Role: Send the image to Gemini to ask: "Analyze this person's skin tone and clothing. Suggest the perfect professional solid hex color for a passport background that provides high contrast and looks natural."
+
+2. Intelligent Color SelectionGemini can return a specific Hex code (e.g., #ADD8E6 for light blue).Logic: Your Python app takes that Hex code and applies it as the new background layer using the Pillow library.
+
+3. Face Detection & Head-to-Chest FramingThis is where OpenCV shines.Detection: Use OpenCV’s Haar Cascades or MediaPipe to find the face coordinates.Gemini Strategy: You can send the image to Gemini and ask for the bounding box coordinates of the person's "head" and "chest."Cropping: Once you have coordinates, use Pillow to crop the image to a 3:4 aspect ratio.
+
+4. Adding the Border & Final ExportWhile you asked to use Gemini for the border, it is technically safer to do this via code to ensure the border is exactly $X$ pixels wide and perfectly straight.

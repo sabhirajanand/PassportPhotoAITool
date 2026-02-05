@@ -1,0 +1,7 @@
+google-generativeai
+customtkinter
+rembg
+onnxruntime
+Pillow
+opencv-python
+python-dotenv
