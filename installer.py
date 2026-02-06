@@ -29,6 +29,24 @@ def _get_install_marker_path():
     return _get_app_data_dir() / ".installed"
 
 
+def get_rembg_model_dir():
+    """Directory for rembg u2net models (same location as app data). Use this only; no ~/.u2net fallback."""
+    return _get_app_data_dir() / "u2net"
+
+
+def ensure_rembg_model_dir():
+    """
+    Create app model dir and set U2NET_HOME so rembg uses it only.
+    Raises PermissionError or OSError if the directory cannot be created.
+    """
+    d = get_rembg_model_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        raise type(e)(f"Cannot create model folder at {d}. Fix permissions or run from a writable location.") from e
+    os.environ["U2NET_HOME"] = str(d)
+
+
 def is_first_run():
     """True if installer has not been run yet (no marker file)."""
     marker = _get_install_marker_path()

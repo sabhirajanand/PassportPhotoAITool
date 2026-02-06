@@ -36,6 +36,10 @@ else:
     TEMP_DIR = APP_DIR / "assets" / "temp"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Use app-local rembg models only (set before any rembg import)
+if "U2NET_HOME" not in os.environ:
+    os.environ["U2NET_HOME"] = str(_get_app_data_dir() / "u2net")
+
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 CROP_RATIOS = [
@@ -51,8 +55,27 @@ CROP_RATIOS = [
 
 BORDER_PX = 10
 PREVIEW_SIZE = 380  # max dimension so image stays contained in preview area
+
+
+def _get_rembg_error_message():
+    """If the background service wrote an error (e.g. permission), return it and clear the file."""
+    try:
+        err_file = _get_app_data_dir() / "rembg_error.txt"
+        if err_file.exists():
+            msg = err_file.read_text(encoding="utf-8").strip()
+            try:
+                err_file.unlink()
+            except OSError:
+                pass
+            return msg or None
+    except Exception:
+        pass
+    return None
 MAX_PREVIEW_HEIGHT = 400
 UPSCALE_FACTOR = 2  # Enlarge after background for better quality when zooming
+
+# Set to True to use Gemini for suggested background color; False to use default white only
+ENABLE_GEMINI = False
 
 # Modern palette
 COLORS = {
@@ -96,6 +119,18 @@ class App(ctk.CTk):
         self._crop_ratio_index = 2  # default 3:4 (passport)
 
         self._build_ui()
+        # Start background rembg service after a short delay (stays running after app closes)
+        self.after(1500, self._start_rembg_service)
+
+    def _start_rembg_service(self):
+        """Start the background rembg service in a thread so it stays running after app closes."""
+        def _run():
+            try:
+                from core.rembg_client import start_service_background
+                start_service_background()
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
 
     def _get_processor(self):
         """Lazy-load ImageProcessor (pulls in rembg/cv2/numpy on first use)."""
@@ -237,7 +272,7 @@ class App(ctk.CTk):
         self.step2_color_swatch.pack(side="left", padx=(0, 6))
         self.step2_color_label = ctk.CTkLabel(selected_row, text="#FFFFFF", font=ctk.CTkFont(size=12), text_color=COLORS["text"])
         self.step2_color_label.pack(side="left")
-        # Gemini suggested color with Apply button (shown when we have a suggestion)
+        # Gemini suggested color with Apply button (shown when ENABLE_GEMINI and we have a suggestion)
         self.step2_gemini_suggested_hex = None
         self.step2_gemini_row = ctk.CTkFrame(step2_picker_frame, fg_color="transparent")
         self.step2_gemini_row.pack(anchor="w", pady=(12, 0))
@@ -246,7 +281,7 @@ class App(ctk.CTk):
         self.step2_gemini_swatch.pack(side="left", padx=(0, 8))
         self.btn_apply_gemini = ctk.CTkButton(self.step2_gemini_row, text="Apply", command=self._apply_gemini_suggested_color, width=70, height=28, corner_radius=6, fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"])
         self.btn_apply_gemini.pack(side="left")
-        self.step2_gemini_row.pack_forget()  # show only after we have a suggestion
+        self.step2_gemini_row.pack_forget()  # shown by _update_step2_color_ui when ENABLE_GEMINI and we have a suggestion
         step2_nav = ctk.CTkFrame(self.step2_frame, fg_color="transparent")
         step2_nav.grid(row=3, column=0, sticky="ew", pady=(0, 12))
         step2_nav.grid_columnconfigure(0, weight=1)
@@ -429,35 +464,69 @@ class App(ctk.CTk):
             return
         self._processing = True
         self.btn_remove_bg.configure(state="disabled")
-        self._set_status("Removing background…", "info")
+        self._set_status("Connecting to background service…", "info")
         self._show_step2_loader()
 
         def run():
             t0 = time.perf_counter()
             try:
                 img = self.step1_cropped
-                # Run three models (body + body + cloth) and Gemini in parallel
-                with ThreadPoolExecutor(max_workers=4) as ex:
-                    future_mask_a = ex.submit(self._get_processor().get_mask_a, img)
-                    future_mask_b = ex.submit(self._get_processor().get_mask_b, img)
-                    future_mask_cloth = ex.submit(self._get_processor().get_mask_cloth, img)
-                    future_bg = ex.submit(self._get_ai().suggest_background_color, pil_image=img)
-                    mask_a = future_mask_a.result()
-                    mask_b = future_mask_b.result()
-                    mask_cloth = future_mask_cloth.result()
-                    bg = future_bg.result()
-                self.step2_bg_source = "api" if bg is not None else "default"
+                rgba = None
+                bg = None
+                # Try background rembg service first (fast if service is already running)
+                self.after(0, lambda: self._set_status("Removing background…", "info"))
+                try:
+                    from core.rembg_client import remove_background_via_service
+                    if ENABLE_GEMINI:
+                        with ThreadPoolExecutor(max_workers=2) as ex:
+                            future_rgba = ex.submit(remove_background_via_service, img)
+                            future_bg = ex.submit(self._get_ai().suggest_background_color, pil_image=img)
+                            rgba = future_rgba.result()
+                            bg = future_bg.result()
+                    else:
+                        rgba = remove_background_via_service(img)
+                        bg = None
+                except Exception:
+                    rgba = None
+                    bg = None
+                # Fallback: in-process removal (three models + combine)
+                if rgba is None:
+                    self.after(0, lambda: self._set_status("Loading models (may download on first run)…", "info"))
+                    if ENABLE_GEMINI:
+                        with ThreadPoolExecutor(max_workers=4) as ex:
+                            future_mask_a = ex.submit(self._get_processor().get_mask_a, img)
+                            future_mask_b = ex.submit(self._get_processor().get_mask_b, img)
+                            future_mask_cloth = ex.submit(self._get_processor().get_mask_cloth, img)
+                            future_bg = ex.submit(self._get_ai().suggest_background_color, pil_image=img)
+                            mask_a = future_mask_a.result()
+                            mask_b = future_mask_b.result()
+                            mask_cloth = future_mask_cloth.result()
+                            bg = future_bg.result()
+                    else:
+                        with ThreadPoolExecutor(max_workers=3) as ex:
+                            future_mask_a = ex.submit(self._get_processor().get_mask_a, img)
+                            future_mask_b = ex.submit(self._get_processor().get_mask_b, img)
+                            future_mask_cloth = ex.submit(self._get_processor().get_mask_cloth, img)
+                            mask_a = future_mask_a.result()
+                            mask_b = future_mask_b.result()
+                            mask_cloth = future_mask_cloth.result()
+                        bg = None
+                    self.after(0, lambda: self._set_status("Combining masks and refining edges…", "info"))
+                    rgba = self._get_processor().combine_masks_and_cutout(
+                        img, mask_a, mask_b, mask_cloth=mask_cloth,
+                        alpha_matting=True,
+                        post_process_mask=True,
+                    )
+                self.step2_bg_source = "api" if (ENABLE_GEMINI and bg is not None) else "default"
                 if bg is None:
                     bg = "#FFFFFF"
-                self.step2_gemini_suggested_hex = bg  # store so user can re-apply via Apply
-                self.after(0, lambda: self._set_status("Combining masks and refining edges…", "info"))
-                rgba = self._get_processor().combine_masks_and_cutout(
-                    img, mask_a, mask_b, mask_cloth=mask_cloth,
-                    alpha_matting=True,
-                    post_process_mask=True,
-                )
+                self.step2_gemini_suggested_hex = bg if ENABLE_GEMINI else None
+                if rgba is None:
+                    err_msg = _get_rembg_error_message()
+                    raise RuntimeError(err_msg or "Background removal failed")
                 self.cached_rgba = rgba
                 self.step2_bg_color = bg
+                self.after(0, lambda: self._set_status("Applying background color…", "info"))
                 step2_rgb = self._get_processor().apply_background(rgba, bg)
                 self.step2_with_bg = self._get_processor().upscale_for_quality(step2_rgb, UPSCALE_FACTOR)
                 elapsed = time.perf_counter() - t0
@@ -468,7 +537,14 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._set_status(f"Done in {elapsed:.1f}s. Change background color if you like, then Next → Step 3.", "success"))
             except Exception as e:
                 self.after(0, lambda: self._hide_step2_loader())
-                self.after(0, lambda: self._set_status(f"Error: {e}", "error"))
+                err_msg = str(e)
+                try:
+                    service_err = _get_rembg_error_message()
+                    if service_err:
+                        err_msg = service_err
+                except Exception:
+                    pass
+                self.after(0, lambda msg=err_msg: self._set_status(f"Error: {msg}", "error"))
                 self.after(0, lambda: self.btn_remove_bg.configure(state="normal"))
             finally:
                 self._processing = False
@@ -481,7 +557,7 @@ class App(ctk.CTk):
         self.step2_color_label.configure(text=hex_color)
         if hasattr(self, "step2_hsv_picker") and self.step2_hsv_picker.winfo_exists():
             self.step2_hsv_picker.set_hex(hex_color)
-        if self.step2_gemini_suggested_hex:
+        if ENABLE_GEMINI and self.step2_gemini_suggested_hex:
             self.step2_gemini_swatch.configure(fg_color=self.step2_gemini_suggested_hex)
             self.step2_gemini_row.pack(anchor="w", pady=(12, 0))
         else:

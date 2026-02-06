@@ -1,14 +1,18 @@
 """
-Launcher: show splash with logo and "Loading..." while loading the app in a background thread.
+Launcher: show splash with logo, log window, and loading while setting up the app.
 Entry point for best startup UX. Use this for PyInstaller; "python main.py" redirects here too.
 """
+import os
+import queue
 import sys
 import threading
 import time
 from pathlib import Path
 
+
 # Minimal imports so splash appears quickly
 import tkinter as tk
+from tkinter import scrolledtext
 
 
 def _run_installer_if_frozen():
@@ -26,11 +30,13 @@ def _run_installer_if_frozen():
 
 
 def _show_splash_and_launch():
-    """Show splash window (tk), load main app in thread, then destroy splash and run app."""
+    """Show splash window with log area, load and set up app in thread, then run app."""
     splash = tk.Tk()
     splash.title("PassportAI")
-    splash.geometry("420x320")
-    splash.resizable(False, False)
+    w, h = 500, 520
+    splash.geometry(f"{w}x{h}")
+    splash.resizable(True, True)
+    splash.minsize(400, 400)
     splash.overrideredirect(False)
 
     # Dark theme to match app
@@ -39,7 +45,6 @@ def _show_splash_and_launch():
 
     # Center on screen
     splash.update_idletasks()
-    w, h = 420, 320
     sw = splash.winfo_screenwidth()
     sh = splash.winfo_screenheight()
     x = (sw - w) // 2
@@ -49,52 +54,99 @@ def _show_splash_and_launch():
     # Logo / title
     title = tk.Label(
         splash, text="PassportAI",
-        font=("Segoe UI", 32, "bold"),
+        font=("Segoe UI", 28, "bold"),
         fg="white", bg=bg,
     )
-    title.pack(pady=(56, 8))
+    title.pack(pady=(24, 4))
 
     # Subtitle
     tk.Label(
         splash, text="Passport photo tool",
-        font=("Segoe UI", 11),
+        font=("Segoe UI", 10),
         fg="#94a3b8", bg=bg,
-    ).pack(pady=(0, 24))
+    ).pack(pady=(0, 12))
 
-    # Loading label
-    loading_label = tk.Label(
-        splash, text="Loading…",
-        font=("Segoe UI", 12),
-        fg="#a5b4fc", bg=bg,
+    # Log area (thread-safe: background thread puts lines in queue; flush runs on main thread)
+    log_frame = tk.Frame(splash, bg=bg)
+    log_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+    log_queue = queue.Queue()
+    log_text = scrolledtext.ScrolledText(
+        log_frame,
+        height=14,
+        font=("Consolas", 9),
+        fg="#e2e8f0",
+        bg="#0f172a",
+        insertbackground="#e2e8f0",
+        relief=tk.FLAT,
+        padx=8,
+        pady=8,
     )
-    loading_label.pack(pady=8)
+    log_text.pack(fill=tk.BOTH, expand=True)
+    log_text.configure(state=tk.DISABLED)
 
-    # Simple animated dots (cycle every 400ms)
-    dots = [".", "..", "..."]
-    dot_index = [0]
+    def append_log(msg):
+        log_queue.put(msg)
 
-    def update_dots():
-        loading_label.configure(text="Loading" + dots[dot_index[0] % 3])
-        dot_index[0] += 1
-        if splash.winfo_exists():
-            splash.after(400, update_dots)
+    def flush_log():
+        try:
+            while True:
+                msg = log_queue.get_nowait()
+                if not splash.winfo_exists():
+                    return
+                log_text.configure(state=tk.NORMAL)
+                log_text.insert(tk.END, msg + "\n")
+                log_text.see(tk.END)
+                log_text.configure(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        if splash.winfo_exists() and not state["done"]:
+            splash.after(50, flush_log)
 
-    splash.after(200, update_dots)
+    splash.after(100, flush_log)
 
     # Loading state: (done, initial_file)
     state = {"done": False, "initial_file": None}
 
     def load_in_background():
         try:
-            import main  # Heavy imports (rembg, onnx, ctk, etc.) run here
+            append_log("Starting PassportAI…")
+            # Use app-local model dir only (no ~/.u2net); set before any rembg load
+            try:
+                from installer import ensure_rembg_model_dir, get_rembg_model_dir
+                ensure_rembg_model_dir()
+                append_log("Model folder: " + str(get_rembg_model_dir()))
+            except (PermissionError, OSError) as e:
+                from installer import get_rembg_model_dir
+                os.environ["U2NET_HOME"] = str(get_rembg_model_dir())
+                append_log("Permission error: " + str(e))
+                append_log("Using model folder only: " + str(get_rembg_model_dir()))
+            append_log("Loading main module…")
+            import main  # Heavy imports (ctk, PIL, etc.) run here
             state["initial_file"] = main._get_initial_file_from_args()
-        except Exception:
-            pass
+            append_log("Main module loaded.")
+            # Only check model file existence; models load in the background service
+            append_log("Checking background removal models…")
+            try:
+                from installer import get_rembg_model_dir
+                model_dir = get_rembg_model_dir()
+                if model_dir.is_dir():
+                    onnx = list(model_dir.glob("*.onnx"))
+                    if onnx:
+                        append_log(f"  Models found: {len(onnx)} file(s)")
+                    else:
+                        append_log("  No model files yet (service will download on first use).")
+                else:
+                    append_log("  No model cache yet (service will download on first use).")
+            except Exception as e:
+                append_log(f"  Note: {e}")
+            append_log("Ready.")
+        except Exception as e:
+            append_log(f"Error: {e}")
         state["done"] = True
 
     threading.Thread(target=load_in_background, daemon=True).start()
 
-    # Poll until loading is done (so we're not inside splash.mainloop when we switch to app)
+    # Poll until loading is done
     while not state["done"]:
         splash.update()
         time.sleep(0.05)
@@ -126,7 +178,11 @@ def _show_splash_and_launch():
 
 
 def main():
-    """Entry point: installer check (frozen), then splash + load app."""
+    """Entry point: installer check (frozen), then splash + app; or run rembg service if --service."""
+    if "--service" in sys.argv:
+        from core.rembg_service import main as service_main
+        service_main()
+        sys.exit(0)
     if not _run_installer_if_frozen():
         sys.exit(0)
     _show_splash_and_launch()
