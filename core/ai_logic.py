@@ -1,17 +1,14 @@
 """
 Gemini API for background color suggestion only (no auto crop).
 Uses gemini-2.5-flash (free tier 2026); fallback to gemini-2.0-flash if 404.
+google.generativeai is lazy-imported on first use for faster app startup.
 """
 import json
 import logging
 import os
 from pathlib import Path
 
-import google.generativeai as genai
-from dotenv import load_dotenv
 from PIL import Image
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +16,28 @@ THUMBNAIL_MAX_SIZE = 512
 MODEL_NAMES = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash")
 
 
-class AILogic:
-    def __init__(self):
-        self.model = None
+def _ensure_genai_configured(instance):
+    """Lazy-load google.generativeai and set instance.model on first use."""
+    if instance.model is not None:
+        return True
+    try:
+        from dotenv import load_dotenv
+        import google.generativeai as genai
+        load_dotenv()
         api_key = os.getenv("GOOGLE_API_KEY")
         if api_key:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(MODEL_NAMES[0])
-        else:
-            print("Warning: GOOGLE_API_KEY not found in .env")
+            instance.model = genai.GenerativeModel(MODEL_NAMES[0])
+            return True
+        print("Warning: GOOGLE_API_KEY not found in .env")
+    except Exception as e:
+        logger.warning("Failed to load Gemini: %s", e)
+    return False
+
+
+class AILogic:
+    def __init__(self):
+        self.model = None  # set on first suggest_background_color call
 
     def _create_thumbnail(self, image_path, out_path, max_size=THUMBNAIL_MAX_SIZE):
         img = Image.open(image_path).convert("RGB")
@@ -53,8 +63,9 @@ class AILogic:
         Pass image_path=... or pil_image=... (PIL Image); if pil_image, saves to temp first.
         Tries gemini-2.5-flash first; on 404 falls back to gemini-2.0-flash, then gemini-1.5-flash.
         """
-        if not self.model or (image_path is None and pil_image is None):
+        if not _ensure_genai_configured(self) or (image_path is None and pil_image is None):
             return None
+        import google.generativeai as genai
         temp_dir = Path(__file__).resolve().parent.parent / "assets" / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         thumb_path = temp_dir / "gemini_thumb.jpg"
@@ -88,7 +99,7 @@ Return ONLY a single JSON object with one key: "bg_color" (string, hex including
 Example: {"bg_color": "#E8EEF2"}"""
         for name in MODEL_NAMES:
             try:
-                model = genai.GenerativeModel(name)
+                model = self.model if name == MODEL_NAMES[0] else genai.GenerativeModel(name)
                 response = model.generate_content([thumb_file, prompt])
                 result = self._parse_json_response(response.text)
                 bg_color = result.get("bg_color") or "#FFFFFF"

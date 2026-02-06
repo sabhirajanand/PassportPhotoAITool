@@ -1,6 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for PassportPhotoCreator – standalone app (no Python required).
 # Build: pyinstaller PassportPhotoCreator.spec
+#
+# Startup optimizations:
+# - No heavy AI in hiddenimports (rembg/onnx/cv2/numpy); let PyInstaller pull them
+#   from modules that import them. Use lazy imports in code for bg removal.
+# - noarchive=True: faster startup (more disk, less unpack at runtime).
+# - upx_exclude: heavy DLLs not UPX'd so they load faster.
 
 import os
 import sys
@@ -12,40 +18,28 @@ ctk_datas = [
     (os.path.join(_ctk_dir, "assets"), "customtkinter/assets"),
 ]
 
+# Metadata for pymatting/rembg when user runs background removal (lazy-loaded path)
+from PyInstaller.utils.hooks import copy_metadata
+metadata_datas = []
+for pkg in ("pymatting", "rembg"):
+    try:
+        metadata_datas += copy_metadata(pkg)
+    except Exception:
+        pass
+
 block_cipher = None
 
 a = Analysis(
-    ["main.py"],
+    ["launch.py"],
     pathex=[],
     binaries=[],
-    datas=ctk_datas,
+    datas=ctk_datas + metadata_datas,
+    # Minimal hiddenimports: only what PyInstaller truly misses. No cv2/numpy/rembg/onnx
+    # here so they are not forced at startup; they are included via import graph when used.
     hiddenimports=[
-        "customtkinter",
-        "PIL",
-        "PIL.Image",
-        "PIL._tkinter_finder",
-        "tkinter",
-        "cv2",
-        "numpy",
+        "dotenv",
         "google.generativeai",
         "google.generativeai.types",
-        "dotenv",
-        "rembg",
-        "rembg.bg",
-        "rembg.sessions.u2net",
-        "rembg.sessions.u2net_cloth_seg",
-        "rembg.sessions.u2net_human_seg",
-        "onnxruntime",
-        "onnxruntime.capi",
-        "onnxruntime.capi._pybind_state",
-        "core",
-        "core.ai_logic",
-        "core.processor",
-        "crop_canvas",
-        "a4_print_preview",
-        "hsv_picker",
-        "installer",
-        "zoom_pan_image",
     ],
     hookspath=[],
     hooksconfig={},
@@ -54,7 +48,7 @@ a = Analysis(
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
-    noarchive=False,
+    noarchive=True,  # faster startup (modules on disk, not in PYZ)
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
@@ -84,6 +78,13 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=[
+        "python*.dll",
+        "onnxruntime*.dll",
+        "opencv*.dll",
+        "cv2*.pyd",
+        "numpy*.pyd",
+        "pywintypes*.dll",
+    ],
     name="PassportPhotoCreator",
 )

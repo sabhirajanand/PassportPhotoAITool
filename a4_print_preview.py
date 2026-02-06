@@ -8,8 +8,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import tkinter as tk
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageTk
 
 # A4 in mm
 A4_W_MM = 210.0
@@ -67,45 +68,67 @@ def build_a4_sheet(pil_photo, rows, dpi=PREVIEW_DPI, margin_mm=DEFAULT_MARGIN_MM
 
 
 def _get_printers():
-    """Return list of (name, display_name) for dropdown. First is default."""
-    try:
-        if sys.platform == "darwin":
-            out = subprocess.run(
-                ["lpstat", "-p"], capture_output=True, text=True, timeout=5
-            )
-            if out.returncode == 0 and out.stdout:
-                names = []
-                for line in out.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[0] == "printer":
-                        names.append(parts[1])
-                if names:
-                    return [(n, n) for n in names]
-        elif sys.platform.startswith("linux"):
-            out = subprocess.run(
-                ["lpstat", "-p"], capture_output=True, text=True, timeout=5
-            )
-            if out.returncode == 0 and out.stdout:
-                names = []
-                for line in out.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[0] == "printer":
-                        names.append(parts[1])
-                if names:
-                    return [(n, n) for n in names]
-        elif sys.platform == "win32":
+    """Return list of (name, display_name) for dropdown. Raises on error (no fallback)."""
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        out = subprocess.run(
+            ["lpstat", "-p"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode != 0:
+            err = (out.stderr or out.stdout or "lpstat failed").strip()
+            raise RuntimeError(f"Could not list printers: {err}")
+        names = []
+        for line in (out.stdout or "").strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "printer":
+                names.append(parts[1])
+        if not names:
+            raise RuntimeError("No printers found. Install CUPS / add a printer.")
+        return [(n, n) for n in names]
+
+    if sys.platform == "win32":
+        try:
+            import win32print
+        except ImportError as e:
+            raise RuntimeError(
+                "pywin32 is required to list printers on Windows. "
+                "Install with: pip install pywin32"
+            ) from e
+        # PRINTER_ENUM_LOCAL works reliably; CONNECTIONS/NETWORK can fail on some systems
+        flags = win32print.PRINTER_ENUM_LOCAL
+        printers = []
+        try:
+            # Level 1: returns tuple (flags, description, name, comment) per printer
+            for p in win32print.EnumPrinters(flags, None, 1):
+                name = p[2] if isinstance(p, (tuple, list)) else p.get("pPrinterName")
+                if name:
+                    printers.append((name, name))
+        except Exception:
+            pass
+        if not printers:
             try:
-                import win32print
-                printers = []
-                for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS):
-                    printers.append((p[2], p[2]))
-                if printers:
-                    return printers
-            except ImportError:
+                # Level 2: returns list of dicts with 'pPrinterName'
+                for p in win32print.EnumPrinters(flags, None, 2):
+                    name = p.get("pPrinterName") if isinstance(p, dict) else (p[2] if len(p) > 2 else None)
+                    if name:
+                        printers.append((name, name))
+            except Exception:
                 pass
-    except Exception:
-        pass
-    return [("default", "Default printer")]
+        if not printers:
+            # Last resort: use default printer if enumeration returned nothing
+            try:
+                default_name = win32print.GetDefaultPrinter()
+                if default_name:
+                    printers.append((default_name, default_name))
+            except Exception:
+                pass
+        if not printers:
+            raise RuntimeError(
+                "No printers found. Check that printers are installed and shared, "
+                "and that Windows Print Spooler service is running."
+            )
+        return printers
+
+    raise RuntimeError(f"Unsupported platform for printer list: {sys.platform}")
 
 
 def _open_system_print_dialog(path):
@@ -132,17 +155,51 @@ def _open_system_print_dialog(path):
         pass
 
 
-def _open_printer_settings():
-    """Open system printer / printing preferences."""
+def _open_printer_settings_system():
+    """Open system printer / printing preferences (used on non-Windows or when pywin32 dialog not used)."""
     try:
         if sys.platform == "darwin":
             subprocess.Popen(["open", "x-apple.systempreferences:com.apple.PrintingPrefs"], start_new_session=True)
         elif sys.platform == "win32":
-            subprocess.Popen(["rundll32.exe", "printui.dll,PrintUIEntry", "/n"], start_new_session=True)
+            subprocess.Popen(
+                ["explorer", "shell:::{A8A91A66-3A7D-4424-8D24-04E180695C7A}"],
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
         else:
             subprocess.Popen(["system-config-printer"], start_new_session=True)
     except Exception:
         pass
+
+
+def _open_printer_properties_win32(printer_name, parent_hwnd=None):
+    """Open printer properties dialog (DocumentProperties) for this print job. Returns modified DEVMODE or None."""
+    import win32print
+    if not printer_name or printer_name == "default":
+        return None
+    hprinter = win32print.OpenPrinter(printer_name)
+    try:
+        info = win32print.GetPrinter(hprinter, 2)
+        devmode = info.get("pDevMode")
+        if devmode is None:
+            return None
+        # Show the dialog: current devmode in/out, DM_IN_PROMPT to display the dialog
+        mode = (
+            getattr(win32print, "DM_IN_BUFFER", 1)
+            | getattr(win32print, "DM_OUT_BUFFER", 2)
+            | getattr(win32print, "DM_IN_PROMPT", 4)
+        )
+        win32print.DocumentProperties(
+            parent_hwnd or 0,
+            hprinter,
+            printer_name,
+            devmode,
+            devmode,
+            mode,
+        )
+        return devmode
+    finally:
+        win32print.ClosePrinter(hprinter)
 
 
 class A4PrintPreviewWindow(ctk.CTkToplevel):
@@ -153,10 +210,15 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
         self.title("Print — Passport photos on A4")
         self.pil_photo = pil_photo
         self._sheet_image = None
-        self._ctk_img = None
         self._rows = 1
         self._margin_mm = DEFAULT_MARGIN_MM
-        self._printers = _get_printers()
+        self._printer_error = None
+        self._devmode = None  # Windows: DEVMODE from printer properties dialog
+        try:
+            self._printers = _get_printers()
+        except Exception as e:
+            self._printers = [("default", "Default printer")]
+            self._printer_error = str(e)
         self._max_rows_val = _max_rows(self._margin_mm)
 
         # Main horizontal split: left = preview, right = options
@@ -164,13 +226,20 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
         self.grid_columnconfigure(1, minsize=OPTIONS_PANEL_WIDTH)
         self.grid_rowconfigure(0, weight=1)
 
-        # —— Left: preview ——
-        preview_container = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=8)
-        preview_container.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
-        preview_container.grid_columnconfigure(0, weight=1)
-        preview_container.grid_rowconfigure(0, weight=1)
-        self.preview_label = ctk.CTkLabel(preview_container, text="", fg_color="transparent")
-        self.preview_label.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        # —— Left: preview (Canvas so image is clipped, centered, never overflows) ——
+        self.preview_container = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=8)
+        self.preview_container.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
+        self.preview_container.grid_columnconfigure(0, weight=1)
+        self.preview_container.grid_rowconfigure(0, weight=1)
+        self.preview_inner = ctk.CTkFrame(self.preview_container, fg_color="transparent")
+        self.preview_inner.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.preview_inner.grid_columnconfigure(0, weight=1)
+        self.preview_inner.grid_rowconfigure(0, weight=1)
+        self.preview_canvas = tk.Canvas(
+            self.preview_inner, bg="#2b2b2b", highlightthickness=0
+        )
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self._photo = None  # keep ref so image is not garbage-collected
 
         # —— Right: options ——
         options_frame = ctk.CTkFrame(self, fg_color=("gray92", "gray18"), width=OPTIONS_PANEL_WIDTH, corner_radius=8, border_width=1, border_color=("gray80", "gray30"))
@@ -191,8 +260,15 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
             opts, variable=self.printer_var, values=[p[1] for p in self._printers],
             width=OPTIONS_PANEL_WIDTH - 32, height=32, corner_radius=6
         )
-        self.printer_menu.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 12))
+        self.printer_menu.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 4))
         row += 1
+        if self._printer_error:
+            self.printer_error_label = ctk.CTkLabel(
+                opts, text=self._printer_error, font=ctk.CTkFont(size=11),
+                text_color=("red", "#f87171"), wraplength=OPTIONS_PANEL_WIDTH - 32
+            )
+            self.printer_error_label.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 12))
+            row += 1
 
         # Margins (mm)
         ctk.CTkLabel(opts, text="Margin (mm):", font=ctk.CTkFont(size=13)).grid(row=row, column=0, sticky="w", padx=16, pady=(8, 4))
@@ -219,15 +295,15 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
         self.rows_hint.pack(side="left", padx=4, pady=0)
         row += 1
 
-        # Printer settings (paper type, quality, etc. — opens system dialog)
+        # Printer settings (paper, quality, orientation — on Windows opens DocumentProperties)
         ctk.CTkButton(
-            opts, text="Printer settings…", command=_open_printer_settings,
+            opts, text="Printer settings…", command=self._open_printer_settings,
             width=OPTIONS_PANEL_WIDTH - 32, height=32, corner_radius=8,
             fg_color="transparent", border_width=1
         ).grid(row=row, column=0, sticky="ew", padx=16, pady=(8, 12))
         row += 1
 
-        ctk.CTkLabel(opts, text="Paper type, print quality, and other options are set in your system printer settings.", font=ctk.CTkFont(size=11), text_color="gray", wraplength=OPTIONS_PANEL_WIDTH - 32).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 16))
+        ctk.CTkLabel(opts, text="Paper size, type, quality, color mode, DPI, and orientation in Printer settings are applied to this print job.", font=ctk.CTkFont(size=11), text_color="gray", wraplength=OPTIONS_PANEL_WIDTH - 32).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 16))
         row += 1
 
         # Buttons at bottom of options
@@ -241,6 +317,7 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
         self._update_rows_hint()
         self._redraw()
         self.after(100, self._maximize)
+        self.after(250, self._redraw)  # redraw after layout so preview fits and centers
         self.bind("<Configure>", self._on_resize)
         self._resize_job = None
 
@@ -302,37 +379,159 @@ class A4PrintPreviewWindow(ctk.CTkToplevel):
         margin = self._get_margin_mm()
         self._sheet_image = build_a4_sheet(self.pil_photo, self._rows, margin_mm=margin)
         w, h = self._sheet_image.size
-        # Size to fit left panel
+        if w <= 0 or h <= 0:
+            return
         self.update_idletasks()
-        pw = self.winfo_width() - OPTIONS_PANEL_WIDTH - 40
-        ph = self.winfo_height() - 40
-        if pw < 100:
-            pw = 600
-        if ph < 100:
-            ph = 700
-        r = min(pw / w, ph / h, 1.0)
-        dw, dh = int(w * r), int(h * r)
-        disp = self._sheet_image.resize((dw, dh), Image.Resampling.LANCZOS) if r < 1 else self._sheet_image
-        dw, dh = disp.size
-        self._ctk_img = ctk.CTkImage(light_image=disp, size=(dw, dh))
-        self.preview_label.configure(image=self._ctk_img, text="")
+        # Use canvas size so preview is always clipped to visible area; scale to fit, center
+        cw = max(1, self.preview_canvas.winfo_width())
+        ch = max(1, self.preview_canvas.winfo_height())
+        if cw <= 10 or ch <= 10:
+            cw = max(cw, self.winfo_width() - OPTIONS_PANEL_WIDTH - 24)
+            ch = max(ch, self.winfo_height() - 24)
+        r = min(cw / w, ch / h)
+        dw = max(1, min(int(w * r), cw))
+        dh = max(1, min(int(h * r), ch))
+        disp = self._sheet_image.resize((dw, dh), Image.Resampling.LANCZOS)
+        self.preview_canvas.delete("all")
+        self._photo = ImageTk.PhotoImage(disp)
+        cx, cy = cw // 2, ch // 2
+        self.preview_canvas.create_image(cx, cy, image=self._photo, anchor="center")
 
-    def _print_with_dialog(self):
-        """Save at 300 DPI and open system print dialog so user can choose printer, paper, etc."""
-        if self.pil_photo is None:
+    def _open_printer_settings(self):
+        """On Windows: open DocumentProperties dialog for selected printer and store DEVMODE. Else: open system prefs."""
+        if sys.platform == "win32":
+            try:
+                printer = self.printer_var.get()
+                # Get HWND for modal dialog; 0 is valid (dialog still shows)
+                parent_hwnd = 0
+                try:
+                    parent_hwnd = self.winfo_id()
+                except Exception:
+                    pass
+                self._devmode = _open_printer_properties_win32(printer, parent_hwnd)
+            except Exception:
+                _open_printer_settings_system()
+        else:
+            _open_printer_settings_system()
+
+    def _print_direct_windows(self):
+        """Print directly to selected printer. Uses DEVMODE from Printer settings so paper, quality, color, DPI, etc. are applied. Image fits to page."""
+        import win32print
+        import win32ui
+        from PIL import ImageWin
+
+        # GetDeviceCaps indices for printable area (pixels)
+        HORZRES = 8
+        VERTRES = 10
+
+        printer = self.printer_var.get()
+        if not printer or printer == "default":
             return
         margin = self._get_margin_mm()
-        sheet_300 = build_a4_sheet(self.pil_photo, self._rows, dpi=PRINT_DPI, margin_mm=margin)
-        fd, path = tempfile.mkstemp(suffix=".png")
+        sheet = build_a4_sheet(
+            self.pil_photo,
+            self._rows,
+            dpi=PRINT_DPI,
+            margin_mm=margin,
+        )
+        if sheet.mode != "RGB":
+            sheet = sheet.convert("RGB")
+
+        hdc = None
+        raw_hdc = None
+
         try:
-            os.close(fd)
-            sheet_300.save(path)
-            _open_system_print_dialog(path)
-        except Exception:
+            # Create DC with user's DEVMODE so all settings apply (paper type, quality, color, DPI, orientation, etc.)
+            if self._devmode is not None:
+                try:
+                    import win32gui
+                    # CreateDC with DEVMODE = driver uses exactly these settings for this job
+                    raw_hdc = win32gui.CreateDC("WINSPOOL", printer, self._devmode)
+                    if raw_hdc:
+                        hdc = win32ui.CreateDCFromHandle(raw_hdc)
+                except Exception:
+                    pass
+            if hdc is None:
+                # No DEVMODE or CreateDC failed: use default printer DC
+                hdc = win32ui.CreateDC()
+                hdc.CreatePrinterDC(printer)
+                if self._devmode is not None:
+                    try:
+                        hdc.SetDevMode(self._devmode)
+                    except Exception:
+                        pass
+
+            hdc.StartDoc("A4 Photo Sheet")
+            hdc.StartPage()
+
+            # Fit to page: draw image scaled to printer's printable area
+            hdc_handle = hdc.GetHandleOutput()
             try:
-                os.unlink(path)
+                page_width = win32print.GetDeviceCaps(hdc_handle, HORZRES)
+                page_height = win32print.GetDeviceCaps(hdc_handle, VERTRES)
+            except AttributeError:
+                import ctypes
+                gdi32 = ctypes.windll.gdi32
+                page_width = gdi32.GetDeviceCaps(hdc_handle, HORZRES)
+                page_height = gdi32.GetDeviceCaps(hdc_handle, VERTRES)
+            if page_width <= 0:
+                page_width = sheet.width
+            if page_height <= 0:
+                page_height = sheet.height
+
+            dib = ImageWin.Dib(sheet)
+            dib.draw(hdc.GetHandleOutput(), (0, 0, page_width, page_height))
+
+            hdc.EndPage()
+            hdc.EndDoc()
+        finally:
+            # DeleteDC: only one of these (raw_hdc owns the DC when we used CreateDC with DEVMODE)
+            if raw_hdc is not None:
+                try:
+                    import win32gui
+                    win32gui.DeleteDC(raw_hdc)
+                except Exception:
+                    pass
+            elif hdc is not None:
+                try:
+                    hdc.DeleteDC()
+                except Exception:
+                    pass
+
+    def _print_with_dialog(self):
+        """Windows: print silently to selected printer with stored DEVMODE. Other OSes: open system print dialog."""
+        if self.pil_photo is None:
+            return
+        if sys.platform == "win32":
+            try:
+                self._print_direct_windows()
             except Exception:
-                pass
+                # Fallback: save and open shell print dialog
+                margin = self._get_margin_mm()
+                sheet_300 = build_a4_sheet(self.pil_photo, self._rows, dpi=PRINT_DPI, margin_mm=margin)
+                fd, path = tempfile.mkstemp(suffix=".png")
+                try:
+                    os.close(fd)
+                    sheet_300.save(path)
+                    _open_system_print_dialog(path)
+                except Exception:
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+        else:
+            margin = self._get_margin_mm()
+            sheet_300 = build_a4_sheet(self.pil_photo, self._rows, dpi=PRINT_DPI, margin_mm=margin)
+            fd, path = tempfile.mkstemp(suffix=".png")
+            try:
+                os.close(fd)
+                sheet_300.save(path)
+                _open_system_print_dialog(path)
+            except Exception:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
     def _print_direct(self):
         """Print directly to selected printer (no dialog). Kept for fallback."""

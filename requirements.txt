@@ -5,3 +5,4 @@ onnxruntime
 Pillow
 opencv-python
 python-dotenv
+pywin32 ; sys_platform == "win32"

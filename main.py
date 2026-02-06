@@ -1,5 +1,5 @@
 """
-PassportAI – Modern 3-step flow: (1) Add & crop, (2) Remove bg + color, (3) Border & export.
+PassportAI – Modern 3-step flow: (1) Add & crop, (2) Remove bg (optional) + color, (3) Border & export.
 CTkImage for HighDPI; drag-to-crop canvas; modern UI.
 """
 import logging
@@ -13,10 +13,7 @@ import tkinter as tk
 import customtkinter as ctk
 from PIL import Image
 
-from core.ai_logic import AILogic
-from core.processor import ImageProcessor
 from crop_canvas import CropCanvas
-from a4_print_preview import open_a4_preview
 from hsv_picker import HSVPicker
 from installer import is_first_run, run_installer_if_first_run, _get_app_data_dir
 from zoom_pan_image import ZoomPanImage
@@ -84,8 +81,8 @@ class App(ctk.CTk):
         self.geometry("960x780")
         self.minsize(800, 640)
 
-        self.ai = AILogic()
-        self.processor = ImageProcessor()
+        self._ai = None
+        self._processor = None
 
         self.source_path = None
         self.original_image = None
@@ -99,6 +96,20 @@ class App(ctk.CTk):
         self._crop_ratio_index = 2  # default 3:4 (passport)
 
         self._build_ui()
+
+    def _get_processor(self):
+        """Lazy-load ImageProcessor (pulls in rembg/cv2/numpy on first use)."""
+        if self._processor is None:
+            from core.processor import ImageProcessor
+            self._processor = ImageProcessor()
+        return self._processor
+
+    def _get_ai(self):
+        """Lazy-load AILogic (pulls in google.generativeai on first use)."""
+        if self._ai is None:
+            from core.ai_logic import AILogic
+            self._ai = AILogic()
+        return self._ai
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -183,7 +194,7 @@ class App(ctk.CTk):
         self.step2_frame.grid(row=0, column=0, sticky="nsew")
         self.step2_frame.grid_columnconfigure(0, weight=1)
         self.step2_frame.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(self.step2_frame, text="Remove background and apply suggested color", font=ctk.CTkFont(size=16, weight="bold"), text_color=COLORS["text"]).grid(row=0, column=0, sticky="w", padx=0, pady=(0, 12))
+        ctk.CTkLabel(self.step2_frame, text="Remove background (optional) and set background color", font=ctk.CTkFont(size=16, weight="bold"), text_color=COLORS["text"]).grid(row=0, column=0, sticky="w", padx=0, pady=(0, 12))
         step2_btns = ctk.CTkFrame(self.step2_frame, fg_color="transparent")
         step2_btns.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         step2_btns.grid_columnconfigure(0, weight=1)
@@ -397,21 +408,21 @@ class App(ctk.CTk):
         if self.original_image is None:
             return
         box = self.crop_canvas.get_crop_box()
-        self.step1_cropped = self.processor.crop_image(self.original_image, box)
+        self.step1_cropped = self._get_processor().crop_image(self.original_image, box)
         self._show_step(2)
         self._show_preview_pil(self.preview_zoom_2, self.step1_cropped)
         self.btn_remove_bg.configure(state="normal")
-        self.btn_step2_next.configure(state="disabled")
+        self.btn_step2_next.configure(state="normal")  # allow skipping bg removal
 
     def _back_to_step2(self):
         """Back from Step 3 to Step 2."""
         self._show_step(2)
         if self.step2_with_bg is not None:
             self._show_preview_pil(self.preview_zoom_2, self.step2_with_bg)
-            self.btn_step2_next.configure(state="normal")
         else:
             self._show_preview_pil(self.preview_zoom_2, self.step1_cropped)
         self.btn_remove_bg.configure(state="normal")
+        self.btn_step2_next.configure(state="normal")  # can always go to Step 3 (with or without bg removal)
 
     def _run_step2(self):
         if self.step1_cropped is None or self._processing:
@@ -427,10 +438,10 @@ class App(ctk.CTk):
                 img = self.step1_cropped
                 # Run three models (body + body + cloth) and Gemini in parallel
                 with ThreadPoolExecutor(max_workers=4) as ex:
-                    future_mask_a = ex.submit(self.processor.get_mask_a, img)
-                    future_mask_b = ex.submit(self.processor.get_mask_b, img)
-                    future_mask_cloth = ex.submit(self.processor.get_mask_cloth, img)
-                    future_bg = ex.submit(self.ai.suggest_background_color, pil_image=img)
+                    future_mask_a = ex.submit(self._get_processor().get_mask_a, img)
+                    future_mask_b = ex.submit(self._get_processor().get_mask_b, img)
+                    future_mask_cloth = ex.submit(self._get_processor().get_mask_cloth, img)
+                    future_bg = ex.submit(self._get_ai().suggest_background_color, pil_image=img)
                     mask_a = future_mask_a.result()
                     mask_b = future_mask_b.result()
                     mask_cloth = future_mask_cloth.result()
@@ -440,15 +451,15 @@ class App(ctk.CTk):
                     bg = "#FFFFFF"
                 self.step2_gemini_suggested_hex = bg  # store so user can re-apply via Apply
                 self.after(0, lambda: self._set_status("Combining masks and refining edges…", "info"))
-                rgba = self.processor.combine_masks_and_cutout(
+                rgba = self._get_processor().combine_masks_and_cutout(
                     img, mask_a, mask_b, mask_cloth=mask_cloth,
                     alpha_matting=True,
                     post_process_mask=True,
                 )
                 self.cached_rgba = rgba
                 self.step2_bg_color = bg
-                step2_rgb = self.processor.apply_background(rgba, bg)
-                self.step2_with_bg = self.processor.upscale_for_quality(step2_rgb, UPSCALE_FACTOR)
+                step2_rgb = self._get_processor().apply_background(rgba, bg)
+                self.step2_with_bg = self._get_processor().upscale_for_quality(step2_rgb, UPSCALE_FACTOR)
                 elapsed = time.perf_counter() - t0
                 self.after(0, lambda: self._hide_step2_loader())
                 self.after(0, lambda: self._update_step2_color_ui())
@@ -492,14 +503,20 @@ class App(ctk.CTk):
             hex_color = "#" + hex_color
         self.step2_bg_color = hex_color
         self.step2_bg_source = "custom"
-        step2_rgb = self.processor.apply_background(self.cached_rgba, hex_color)
-        self.step2_with_bg = self.processor.upscale_for_quality(step2_rgb, UPSCALE_FACTOR)
+        step2_rgb = self._get_processor().apply_background(self.cached_rgba, hex_color)
+        self.step2_with_bg = self._get_processor().upscale_for_quality(step2_rgb, UPSCALE_FACTOR)
         self._update_step2_color_ui()
         self._show_preview_pil(self.preview_zoom_2, self.step2_with_bg)
         self._set_status("Background color updated.", "success")
 
+    def _get_image_for_step3(self):
+        """Image to use for Step 3: with bg removal if done, otherwise cropped image."""
+        if self.step2_with_bg is not None:
+            return self.step2_with_bg
+        return self.step1_cropped
+
     def _go_step3(self):
-        if self.step2_with_bg is None:
+        if self._get_image_for_step3() is None:
             return
         self._show_step(3)
         self._preview_step3()
@@ -508,27 +525,31 @@ class App(ctk.CTk):
         self.btn_a4_print.configure(state="normal" if is_passport_34 else "disabled")
 
     def _preview_step3(self):
-        if self.step2_with_bg is None:
+        img = self._get_image_for_step3()
+        if img is None:
             return
         add_border = self.border_check_var.get()
-        img = self.processor.add_border(self.step2_with_bg, BORDER_PX if add_border else 0)
+        img = self._get_processor().add_border(img, BORDER_PX if add_border else 0)
         self._show_preview_pil(self.preview_zoom_3, img)
 
     def _export_png(self):
-        if self.step2_with_bg is None:
+        img = self._get_image_for_step3()
+        if img is None:
             return
         add_border = self.border_check_var.get()
-        img = self.processor.add_border(self.step2_with_bg, BORDER_PX if add_border else 0)
+        img = self._get_processor().add_border(img, BORDER_PX if add_border else 0)
         path = ctk.filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("All", "*.*")], initialdir=os.path.expanduser("~"))
         if path:
-            ok = self.processor.export_png(img, path)
+            ok = self._get_processor().export_png(img, path)
             self._set_status("Saved: " + path if ok else "Save failed.", "success" if ok else "error")
 
     def _open_a4_preview(self):
-        if self.step2_with_bg is None or self._crop_ratio_index != 2:
+        img = self._get_image_for_step3()
+        if img is None or self._crop_ratio_index != 2:
             return
         add_border = self.border_check_var.get()
-        img = self.processor.add_border(self.step2_with_bg, BORDER_PX if add_border else 0)
+        img = self._get_processor().add_border(img, BORDER_PX if add_border else 0)
+        from a4_print_preview import open_a4_preview
         open_a4_preview(self, img)
 
     def _show_preview_pil(self, widget, pil_image):
@@ -562,15 +583,6 @@ def _get_initial_file_from_args():
 
 
 if __name__ == "__main__":
-    # First-run installer only when exported as standalone (frozen)
-    main_script = Path(__file__).resolve()
-    if getattr(sys, "frozen", False):
-        if is_first_run():
-            if not run_installer_if_first_run(executable_path_arg=None):
-                sys.exit(0)
-
-    initial_file = _get_initial_file_from_args()
-    app = App()
-    if initial_file:
-        app.after(300, lambda p=initial_file: app._load_image(p))
-    app.mainloop()
+    # Use launcher for splash screen and deferred loading (better startup UX)
+    import launch
+    launch.main()

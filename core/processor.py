@@ -1,17 +1,12 @@
 """
 Image processing: crop, background removal, background color, optional border, export.
 Triple-model removal: u2net_human_seg + u2net + u2net_cloth_seg run in parallel.
-Human + u2net agree on body; cloth model recovers clothing and edges. Combined mask
-= (human ∩ u2net) ∪ cloth, then alpha matting.
+Heavy deps (rembg, cv2, numpy) are lazy-imported for faster app startup.
 """
 import io
 from pathlib import Path
 
-import cv2
-import numpy as np
 from PIL import Image, ImageColor, ImageOps
-from rembg import remove, new_session
-from rembg.bg import alpha_matting_cutout, naive_cutout, post_process as rembg_post_process
 
 BORDER_PX = 10  # 10px professional border (5 white + 5 black) when enabled
 
@@ -25,6 +20,7 @@ def _get_rembg_session_a():
     """Lazy-load u2net_human_seg for portrait foreground."""
     global _REMBG_SESSION_A
     if _REMBG_SESSION_A is None:
+        from rembg import new_session
         _REMBG_SESSION_A = new_session("u2net_human_seg")
     return _REMBG_SESSION_A
 
@@ -33,6 +29,7 @@ def _get_rembg_session_b():
     """Lazy-load u2net for second opinion on foreground."""
     global _REMBG_SESSION_B
     if _REMBG_SESSION_B is None:
+        from rembg import new_session
         _REMBG_SESSION_B = new_session("u2net")
     return _REMBG_SESSION_B
 
@@ -41,6 +38,7 @@ def _get_rembg_session_c():
     """Lazy-load u2net_cloth_seg for clothing and edge detection."""
     global _REMBG_SESSION_C
     if _REMBG_SESSION_C is None:
+        from rembg import new_session
         _REMBG_SESSION_C = new_session("u2net_cloth_seg")
     return _REMBG_SESSION_C
 
@@ -48,6 +46,8 @@ def _get_rembg_session_c():
 def _head_chest_from_face_opencv(pil_image_rgba):
     """Fallback: OpenCV face → head/chest coords. Used only if needed elsewhere."""
     try:
+        import cv2
+        import numpy as np
         rgb = pil_image_rgba.convert("RGB")
         arr = np.array(rgb)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -134,6 +134,8 @@ class ImageProcessor:
         # Ensure same size
         if mask_a.size != mask_b.size:
             mask_b = mask_b.resize(mask_a.size, Image.Resampling.LANCZOS)
+        import numpy as np
+        from rembg.bg import alpha_matting_cutout, naive_cutout, post_process as rembg_post_process
         a = np.array(mask_a, dtype=np.float32)
         b = np.array(mask_b, dtype=np.float32)
         base = np.minimum(a, b)
@@ -170,6 +172,7 @@ class ImageProcessor:
         """
         if pil_image is None:
             return None
+        from rembg import remove
         if pil_image.mode != "RGB":
             pil_image = pil_image.convert("RGB")
         session = _get_rembg_session_a()
